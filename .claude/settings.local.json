@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(curl:*)",
+      "Bash(pkill:*)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(tesseract:*)",
+      "Read(//c/Program Files/**)",
+      "Bash(\"/c/Program Files/Tesseract-OCR/tesseract.exe\" --version)",
+      "Bash(cat:*)",
+      "Bash(git check-ignore:*)",
+      "Bash(taskkill:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

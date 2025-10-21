@@ -1,0 +1,570 @@
+Got it. We’ll parse **those two PDFs** into a single, consistent JSON shape using **OCR → text-only LLM (Together)**, with a light **regex pre-parser** that already handles the exact formats you uploaded.
+
+Below is a tight Markdown you can drop into your repo.
+
+---
+
+# Invoice Parsing Plan (OCR → LLM → JSON)
+
+## Files to support (from your examples)
+
+* **EXAMPLE_IMAGE_1.pdf**: simple outpatient invoice with member details, diagnosis, and line items (code, name, qty, unit price, line total). 
+* **EXAMPLE_IMAGE_2.pdf**: hospital “FINAL INVOICE” with insurer metadata, diagnoses with ICD-10 codes, treatments table with running balance. 
+
+## What we’re using
+
+* **OCR**: `pytesseract` + `pdf2image`
+* **LLM**: Together API (text-only)
+
+  * **Model**: `meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo`
+  * **Why**: cheap, fast, good for JSON extraction when guided
+* **Env**: configurable via `.env`
+* **Determinism**: regex pre-parser first; LLM is used to normalize/complete JSON
+
+## .env
+
+```
+TOGETHER_API_KEY=your_together_api_key
+LLM_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo
+LLM_TEMPERATURE=0.0
+LLM_MAX_TOKENS=700
+```
+
+---
+
+## Unified JSON schema
+
+We’ll standardize both invoices into:
+
+```json
+{
+  "document": {
+    "source_filename": "EXAMPLE_IMAGE_1.pdf",
+    "invoice_number": "string|null",
+    "invoice_date": "YYYY-MM-DD HH:MM:SS|null",
+    "facility": "string|null",
+    "insurer": "string|null",
+    "scheme": "string|null",
+    "claim_number": "string|null",
+    "reference_no": "string|null",
+    "card_or_referral_no": "string|null"
+  },
+  "member": {
+    "member_name": "string|null",
+    "member_number": "string|null"
+  },
+  "patient": {
+    "patient_name": "string|null"
+  },
+  "diagnoses": [
+    {
+      "description": "string",
+      "icd10": "string|null"
+    }
+  ],
+  "line_items": [
+    {
+      "code": "string|null",
+      "description": "string",
+      "qty": 1,
+      "unit_price": 0.0,
+      "line_total": 0.0,
+      "time": "YYYY-MM-DD - HH:MM:SS|null",
+      "reference": "string|null"
+    }
+  ],
+  "totals": {
+    "net_amount": 0.0,
+    "invoice_amount": 0.0,
+    "total_settlement": 0.0,
+    "balance": 0.0,
+    "currency": "NGN|KES|GBP|...|null",
+    "raw_net_value": "string|null"
+  },
+  "meta": {
+    "authorization_status": "AUTHORIZED|UNAUTHORIZED|null",
+    "registration_no": "string|null",
+    "notes": "string|null"
+  }
+}
+```
+
+### Why this works for your files
+
+* **EXAMPLE_IMAGE_1.pdf** has:
+  `INVOICE NUMBER`, `MEMBER NAME/NUMBER`, `DIAGNOSIS`, line items like `13119033 DOXYCYCLINE 100MG TABLETS 1 3000 3000.0`, and `Net Value: 49000.0`. 
+* **EXAMPLE_IMAGE_2.pdf** has:
+  insurer/scheme/claim numbers, treatments with timestamps, running balances, and a diagnosis table with ICD-10 codes like `Hypertension I10`, `Type 2 Diabetes Mellitus E11`. 
+
+---
+
+## Field mapping (per file)
+
+### A) EXAMPLE_IMAGE_1.pdf → schema
+
+* `INVOICE NUMBER: 10002` → `document.invoice_number`
+* `INVOICE DATE: 2024-11-01 00:00:00` → `document.invoice_date`
+* `SERVICE PROVIDER: LIFELINK MEDICAL CENTER` → `document.facility`
+* `MEMBER NAME: Emily Davis` → `member.member_name`
+* `MEMBER NUMBER: UU223344-06` → `member.member_number`
+* `DIAGNOSIS: Dermatitis` → `diagnoses[0].description = "Dermatitis"; icd10 = null`
+* Line items like
+  `13119033 DOXYCYCLINE 100MG TABLETS 1 3000 3000.0` →
+  `{code:"13119033", description:"DOXYCYCLINE 100MG TABLETS", qty:1, unit_price:3000.0, line_total:3000.0}`
+* `Net Value: 49000.0` → `totals.net_amount=49000.0` and `totals.raw_net_value="49000.0"`; `currency` null (no symbol shown). 
+
+### B) EXAMPLE_IMAGE_2.pdf → schema
+
+* `FINAL INVOICE`, `Insurer Name: HEALTHGUARD`, `Scheme Name: HEALTHGUARD ELITE`
+  → `document.insurer`, `document.scheme`
+* `Claim Number: 98276340215` → `document.claim_number`
+* `Invoice Date: 2025-06-17` → `document.invoice_date="2025-06-17 00:00:00"` (normalize with time)
+* `Invoice No: UPHSF/ERH/OP/832` → `document.invoice_number`
+* `Reference No: REF-HG2025-003` → `document.reference_no`
+* `Card/Referral No: CARD-8590` → `document.card_or_referral_no`
+* `Patient Name: Miriam Njeri` → `patient.patient_name`
+* Treatments lines with timestamps and running balance (e.g. `2025-06-17 - 09:12:30 MRI Scan 1 ... 17,500.00 17,500.00`)
+  → `line_items[]` with `time`, `description`, `qty`, `line_total` and keep `reference` if present; parse `balance` into `totals.balance` at end if only final shown.
+* Diagnosis table: `Hypertension I10`, `Type 2 Diabetes Mellitus E11`
+  → `diagnoses[] = [{"description":"Hypertension","icd10":"I10"}, ...]`
+* Totals: `Inv amt. 22,800.00`, `Total Settlement 22,800.00`, `Net Amount 0.00`
+  → `totals.invoice_amount=22800.00`, `totals.total_settlement=22800.00`, `totals.net_amount=0.00`, currency unknown (no symbol). 
+
+---
+
+## llm.py changes (Together API + few-shot + guardrails)
+
+**What you’ll edit**: keep your file structure, but ensure:
+
+1. We **pre-parse with regex** to fill as much as we can deterministically.
+2. We call Together with a **strict system prompt** and **few-shot examples** from your two files.
+3. We **validate** JSON and normalize numbers/dates.
+
+### Prompt with examples
+
+Add these to your `SYSTEM_PROMPT` (trim if needed):
+
+```text
+You will receive OCR text of a medical invoice. Output ONLY valid JSON matching the schema shown below.
+If unknown, use null or [].
+
+SCHEMA:
+{ ... the Unified JSON schema above ... }
+
+EXAMPLE 1 (EXAMPLE_IMAGE_1.pdf) → JSON
+OCR EXCERPT:
+INVOICE NUMBER: 10002
+MEMBER NAME: Emily Davis
+MEMBER NUMBER: UU223344-06
+INVOICE DATE: 2024-11-01 00:00:00
+SERVICE PROVIDER: LIFELINK MEDICAL CENTER
+AUTHORIZATION BY: UNAUTHORIZED
+DIAGNOSIS: Dermatitis
+13119033 DOXYCYCLINE 100MG TABLETS 1 3000 3000.0
+Net Value: 49000.0
+
+EXPECTED JSON (abbreviated):
+{
+  "document": {
+    "source_filename": "EXAMPLE_IMAGE_1.pdf",
+    "invoice_number": "10002",
+    "invoice_date": "2024-11-01 00:00:00",
+    "facility": "LIFELINK MEDICAL CENTER",
+    "insurer": null, "scheme": null, "claim_number": null, "reference_no": null, "card_or_referral_no": null
+  },
+  "member": {"member_name":"Emily Davis","member_number":"UU223344-06"},
+  "patient": {"patient_name": null},
+  "diagnoses": [{"description":"Dermatitis","icd10":null}],
+  "line_items": [
+    {"code":"13119033","description":"DOXYCYCLINE 100MG TABLETS","qty":1,"unit_price":3000.0,"line_total":3000.0,"time":null,"reference":null}
+  ],
+  "totals":{"net_amount":49000.0,"invoice_amount":49000.0,"total_settlement":null,"balance":null,"currency":null,"raw_net_value":"49000.0"},
+  "meta":{"authorization_status":"UNAUTHORIZED","registration_no":null,"notes":null}
+}
+
+EXAMPLE 2 (EXAMPLE_IMAGE_2.pdf) → JSON
+OCR EXCERPT:
+FINAL INVOICE
+Insurer Name: HEALTHGUARD
+Scheme Name: HEALTHGUARD ELITE
+Claim Number: 98276340215
+Invoice Date: 2025-06-17
+Invoice No: UPHSF/ERH/OP/832
+Reference No: REF-HG2025-003
+Card/Referral No: CARD-8590
+Patient Name: Miriam Njeri
+Diagnosis Details
+Hypertension I10
+Type 2 Diabetes Mellitus E11
+Acute Bronchitis J20
+Inv amt. 22,800.00
+Total Settlement 22,800.00
+Net Amount 0.00
+
+EXPECTED JSON (abbreviated):
+{
+  "document": {
+    "source_filename": "EXAMPLE_IMAGE_2.pdf",
+    "invoice_number": "UPHSF/ERH/OP/832",
+    "invoice_date": "2025-06-17 00:00:00",
+    "facility": "ELDORET REGIONAL HOSPITAL",
+    "insurer": "HEALTHGUARD",
+    "scheme": "HEALTHGUARD ELITE",
+    "claim_number": "98276340215",
+    "reference_no": "REF-HG2025-003",
+    "card_or_referral_no": "CARD-8590"
+  },
+  "member": {"member_name": null,"member_number": null},
+  "patient": {"patient_name": "Miriam Njeri"},
+  "diagnoses": [
+    {"description":"Hypertension","icd10":"I10"},
+    {"description":"Type 2 Diabetes Mellitus","icd10":"E11"},
+    {"description":"Acute Bronchitis","icd10":"J20"}
+  ],
+  "line_items": [],
+  "totals":{"net_amount":0.0,"invoice_amount":22800.0,"total_settlement":22800.0,"balance":0.0,"currency":null,"raw_net_value":null},
+  "meta":{"authorization_status":null,"registration_no":null,"notes":null}
+}
+```
+
+### LLM call (keep yours, ensure this shape)
+
+````python
+# llm.py (core)
+from together import Together
+import json, os, re
+
+client = Together(api_key=os.getenv("TOGETHER_API_KEY"))
+MODEL = os.getenv("LLM_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo")
+TEMP = float(os.getenv("LLM_TEMPERATURE", "0.0"))
+MAXTOK = int(os.getenv("LLM_MAX_TOKENS", "700"))
+
+def llm_normalize(ocr_text: str, source_filename: str, schema_hint: dict) -> dict:
+    messages = [
+        {"role": "system", "content": build_system_prompt_with_examples(schema_hint)},
+        {"role": "user", "content": f"source_filename: {source_filename}\n\n{ocr_text}"}
+    ]
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=TEMP,
+        max_tokens=MAXTOK
+    )
+    out = resp.choices[0].message.content.strip()
+    out = re.sub(r"^```json\s*|\s*```$", "", out, flags=re.IGNORECASE|re.DOTALL).strip()
+    data = json.loads(out)
+
+    # sanity fixes
+    if "document" in data:
+        data["document"]["source_filename"] = source_filename
+        if data["document"].get("invoice_date") and len(data["document"]["invoice_date"]) == 10:
+            data["document"]["invoice_date"] += " 00:00:00"
+
+    return data
+````
+
+> `build_system_prompt_with_examples(schema_hint)` should return the strict schema + the two examples above. Keep it as a big string constant if you prefer.
+
+---
+
+## Regex pre-parser (handles your two PDFs out of the box)
+
+Drop this helper in your backend (or `ocr_utils.py`). It extracts obvious fields before the LLM, improving accuracy and reducing token usage.
+
+```python
+import re
+from typing import Dict, Any, List, Optional
+
+def parse_numbers(s: str) -> Optional[float]:
+    if not s: return None
+    s2 = s.replace(",", "").strip()
+    try:
+        return float(s2)
+    except:
+        return None
+
+def preparse_invoice_text(text: str, source_filename: str) -> Dict[str, Any]:
+    T = {"document": {"source_filename": source_filename}, "member": {}, "patient": {},
+         "diagnoses": [], "line_items": [], "totals": {}, "meta": {}}
+
+    # Common header fields
+    pairs = [
+        (r"INVOICE\s*NUMBER\s*:\s*(.+)", ("document", "invoice_number")),
+        (r"INVOICE\s*DATE\s*:\s*([0-9:\-\s]+)", ("document", "invoice_date")),
+        (r"SERVICE\s*PROVIDER\s*:\s*(.+)", ("document", "facility")),
+        (r"Insurer\s*Name\s*:\s*(.+)", ("document", "insurer")),
+        (r"Scheme\s*Name\s*:\s*(.+)", ("document", "scheme")),
+        (r"Claim\s*Number\s*:\s*(.+)", ("document", "claim_number")),
+        (r"Invoice\s*No\s*:\s*(.+)", ("document", "invoice_number")),
+        (r"Reference\s*No\s*:\s*(.+)", ("document", "reference_no")),
+        (r"(Card|Card/Referral)\s*No\s*:\s*(.+)", ("document", "card_or_referral_no")),
+        (r"MEMBER\s*NAME\s*:\s*(.+)", ("member", "member_name")),
+        (r"MEMBER\s*NUMBER\s*:\s*(.+)", ("member", "member_number")),
+        (r"Patient\s*Name\s*:\s*(.+)", ("patient", "patient_name")),
+        (r"AUTHORIZATION\s*BY\s*:\s*(.+)", ("meta", "authorization_status")),
+        (r"REGISTRATION\s*NO\s*:\s*(.+)", ("meta", "registration_no")),
+    ]
+    for pat, (obj, key) in pairs:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            T[obj][key] = m.group(len(m.groups())).strip()
+
+    # Diagnosis lines
+    # single diagnosis (file 1)
+    m = re.search(r"DIAGNOSIS\s*:\s*(.+)", text, re.IGNORECASE)
+    if m:
+        T["diagnoses"].append({"description": m.group(1).strip(), "icd10": None})
+    # diagnosis table (file 2): rows like "Hypertension I10"
+    for line in text.splitlines():
+        line = line.strip()
+        m2 = re.match(r"([A-Za-z0-9 \-/]+)\s+([A-Z][0-9A-Z]{2,4})$", line)
+        if m2 and any(w in line.lower() for w in ["hypertension","diabetes","bronchitis","asthma","malaria","dermatitis"]):
+            T["diagnoses"].append({"description": m2.group(1).strip(), "icd10": m2.group(2).strip()})
+
+    # Line items (file 1): "13119033 DOXYCYCLINE 100MG TABLETS 1 3000 3000.0"
+    lineitem_pat = re.compile(r"^(\d{5,})\s+(.+?)\s+(\d+)\s+([\d,]+(?:\.\d+)?)\s+([\d,]+(?:\.\d+)?)$", re.IGNORECASE)
+    for raw in text.splitlines():
+        raw = raw.strip()
+        mi = lineitem_pat.match(raw)
+        if mi:
+            code, desc, qty, unitp, total = mi.groups()
+            T["line_items"].append({
+                "code": code,
+                "description": desc.strip(),
+                "qty": int(qty),
+                "unit_price": parse_numbers(unitp) or 0.0,
+                "line_total": parse_numbers(total) or 0.0,
+                "time": None, "reference": None
+            })
+
+    # Treatments with timestamps (file 2): "2025-06-17 - 09:12:30 MRI Scan 1 3952841 17,500.00 17,500.00"
+    tr_pat = re.compile(
+        r"^(\d{4}-\d{2}-\d{2})\s*-\s*(\d{2}:\d{2}:\d{2})\s+(.+?)\s+(\d+)\s+(\d+)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$"
+    )
+    for raw in text.splitlines():
+        raw = raw.strip()
+        mt = tr_pat.match(raw)
+        if mt:
+            d, t, desc, qty, ref, amount, balance = mt.groups()
+            T["line_items"].append({
+                "code": None,
+                "description": desc.strip(),
+                "qty": int(qty),
+                "unit_price": None,
+                "line_total": parse_numbers(amount) or 0.0,
+                "time": f"{d} - {t}",
+                "reference": ref
+            })
+            # keep updating last seen balance
+            T["totals"]["balance"] = parse_numbers(balance) or 0.0
+
+    # Totals
+    net_val = re.search(r"Net\s*Value\s*:\s*([\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+    if net_val:
+        T["totals"]["net_amount"] = parse_numbers(net_val.group(1)) or 0.0
+        T["totals"]["invoice_amount"] = T["totals"]["net_amount"]
+
+    inv_amt = re.search(r"Inv\s*amt\.\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
+    if inv_amt:
+        T["totals"]["invoice_amount"] = parse_numbers(inv_amt.group(1)) or 0.0
+
+    tot_set = re.search(r"Total\s*Settlement\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
+    if tot_set:
+        T["totals"]["total_settlement"] = parse_numbers(tot_set.group(1)) or 0.0
+
+    net_amount2 = re.search(r"Net\s*Amount\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
+    if net_amount2:
+        T["totals"]["net_amount"] = parse_numbers(net_amount2.group(1)) or T["totals"].get("net_amount")
+
+    # Normalize missing keys
+    T["document"].setdefault("invoice_date", None)
+    T["totals"].setdefault("net_amount", None)
+    T["totals"].setdefault("invoice_amount", None)
+    T["totals"].setdefault("total_settlement", None)
+    T["totals"].setdefault("balance", None)
+    T["totals"].setdefault("currency", None)
+    T["totals"].setdefault("raw_net_value", None)
+
+    return T
+```
+
+### How we use pre-parser + LLM together
+
+```python
+# app.py (extract flow)
+from llm import llm_normalize
+from preparse import preparse_invoice_text  # the helper above
+
+def build_schema_hint():
+    # optionally pass the schema dict into the prompt builder
+    return { ... }  # same structure as Unified JSON schema (keys/types only)
+
+@app.post("/extract")
+async def extract(file: UploadFile = File(...)):
+    b = await file.read()
+    ocr_text = load_and_ocr(b, file.filename)
+
+    # 1) regex pre-parse
+    draft = preparse_invoice_text(ocr_text, file.filename)
+
+    # 2) LLM normalization/merge (send OCR text + filename + schema)
+    final = llm_normalize(ocr_text, file.filename, build_schema_hint())
+
+    # 3) merge obvious parsed fields into final if LLM missed them
+    final = merge_preparse_into_llm(draft, final)
+
+    # 4) save and return
+    doc_id = str(uuid.uuid4())
+    DB[doc_id] = {"raw_text": ocr_text, "data": final}
+    return {"document_id": doc_id, "data": final}
+```
+
+Add a simple merge strategy:
+
+```python
+def merge_preparse_into_llm(pre: dict, llm: dict) -> dict:
+    # if llm missed something obvious, fill from pre
+    def fill(path):
+        # path like ("document","invoice_number")
+        src = pre
+        dst = llm
+        for p in path[:-1]:
+            src = src.get(p, {})
+            dst = dst.get(p, {})
+        key = path[-1]
+        if not dst.get(key) and src.get(key) is not None:
+            # assign into llm structure
+            target_parent = llm
+            for p in path[:-1]:
+                if p not in target_parent:
+                    target_parent[p] = {}
+                target_parent = target_parent[p]
+            target_parent[key] = src.get(key)
+
+    critical = [
+        ("document","invoice_number"),
+        ("document","invoice_date"),
+        ("document","facility"),
+        ("document","insurer"),
+        ("document","scheme"),
+        ("document","claim_number"),
+        ("document","reference_no"),
+        ("document","card_or_referral_no"),
+        ("member","member_name"),
+        ("member","member_number"),
+        ("patient","patient_name"),
+        ("totals","invoice_amount"),
+        ("totals","net_amount"),
+        ("totals","total_settlement"),
+        ("totals","balance"),
+    ]
+    for c in critical:
+        fill(c)
+
+    # diagnoses and line items: prefer union with de-dup
+    if not llm.get("diagnoses"): llm["diagnoses"] = []
+    seen_diag = {(d.get("description",""), d.get("icd10")) for d in llm["diagnoses"]}
+    for d in pre.get("diagnoses", []):
+        tup = (d.get("description",""), d.get("icd10"))
+        if tup not in seen_diag:
+            llm["diagnoses"].append(d)
+
+    if not llm.get("line_items"): llm["line_items"] = []
+    seen_li = {(li.get("code"), li.get("description"), li.get("qty"), li.get("line_total")) for li in llm["line_items"]}
+    for li in pre.get("line_items", []):
+        tup = (li.get("code"), li.get("description"), li.get("qty"), li.get("line_total"))
+        if tup not in seen_li:
+            llm["line_items"].append(li)
+
+    return llm
+```
+
+---
+
+## Quick unit tests (paste into `tests/test_extract.py`)
+
+```python
+import pytest
+from preparse import preparse_invoice_text
+
+EX1 = """
+INVOICE
+INVOICE NUMBER: 10002
+MEMBER NAME: Emily Davis
+MEMBER NUMBER: UU223344-06
+INVOICE DATE: 2024-11-01 00:00:00
+SERVICE PROVIDER: LIFELINK MEDICAL CENTER
+AUTHORIZATION BY: UNAUTHORIZED
+DIAGNOSIS: Dermatitis
+13119033 DOXYCYCLINE 100MG TABLETS 1 3000 3000.0
+Net Value: 49000.0
+"""
+
+EX2 = """
+ELDORET REGIONAL HOSPITAL
+FINAL INVOICE
+Insurer Name: HEALTHGUARD
+Scheme Name: HEALTHGUARD ELITE
+Claim Number: 98276340215
+Invoice Date: 2025-06-17
+Invoice No: UPHSF/ERH/OP/832
+Reference No: REF-HG2025-003
+Card/Referral No: CARD-8590
+Patient Name: Miriam Njeri
+Diagnosis Details
+Hypertension I10
+Type 2 Diabetes Mellitus E11
+Acute Bronchitis J20
+Inv amt. 22,800.00
+Total Settlement 22,800.00
+Net Amount 0.00
+"""
+
+def test_preparse_ex1():
+    out = preparse_invoice_text(EX1, "EXAMPLE_IMAGE_1.pdf")
+    assert out["document"]["invoice_number"] == "10002"
+    assert out["member"]["member_name"] == "Emily Davis"
+    assert out["diagnoses"][0]["description"].lower() == "dermatitis"
+    assert out["line_items"][0]["description"].startswith("DOXYCYCLINE")
+    assert out["totals"]["net_amount"] == 49000.0
+
+def test_preparse_ex2():
+    out = preparse_invoice_text(EX2, "EXAMPLE_IMAGE_2.pdf")
+    assert out["document"]["insurer"] == "HEALTHGUARD"
+    assert out["patient"]["patient_name"] == "Miriam Njeri"
+    assert any(d["icd10"] == "I10" for d in out["diagnoses"])
+    assert out["totals"]["invoice_amount"] == 22800.0
+    assert out["totals"]["total_settlement"] == 22800.0
+    assert out["totals"]["net_amount"] == 0.0
+```
+
+---
+
+## Run checklist
+
+```bash
+# system deps
+# macOS: brew install tesseract poppler
+# Ubuntu: sudo apt-get install -y tesseract-ocr poppler-utils
+
+python -m venv venv
+# Windows: venv\Scripts\activate
+# macOS/Linux:
+source venv/bin/activate
+
+pip install -r requirements.txt
+cp .env.example .env  # if you keep a template
+# set TOGETHER_API_KEY in .env
+
+uvicorn app:app --reload --port 8000
+```
+
+---
+
+## Notes
+
+* The regex pre-parser already recognizes the patterns in both PDFs you shared. If OCR is slightly noisy, the LLM step will still normalize fields into the schema.
+* If you want hard validation, add a `pydantic` model for the schema and throw if fields don’t match.
+* If currency symbols appear later, we can auto-detect from symbols and set `totals.currency`.
+
+If you want, I can wire this into your current `llm.py` exactly and push a version that compiles right away.
