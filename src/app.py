@@ -118,8 +118,6 @@ async def ask(request: AskRequest):
         JSON with answer
     """
     try:
-        await asyncio.sleep(2)
-
         # Check if document exists
         if request.document_id not in DOCUMENT_STORE:
             raise HTTPException(status_code=404, detail="Document not found")
@@ -129,10 +127,8 @@ async def ask(request: AskRequest):
         claim_data = doc["data"]
         raw_text = doc["raw_text"]
 
-        internal_question = "What medication is used and why?"
-
         # Answer the question using LLM
-        answer = await answer_question(internal_question, claim_data, raw_text)
+        answer = await answer_question(request.question, claim_data, raw_text)
 
         return {
             "answer": answer
